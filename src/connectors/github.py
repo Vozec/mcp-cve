@@ -35,6 +35,7 @@ def _parse_advisory(adv: dict) -> dict:
     return {
         "ghsa_id": adv.get("ghsa_id", ""),
         "cve_id": adv.get("cve_id", ""),
+        "title": adv.get("summary", ""),
         "summary": adv.get("summary", ""),
         "description": (adv.get("description") or "")[:500],
         "type": adv.get("type", ""),
