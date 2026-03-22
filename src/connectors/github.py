@@ -108,7 +108,8 @@ async def _search_advisories_by_code_search(
     import re
 
     # Build code search query on the advisory-database repo
-    q = f"{keyword} repo:github/advisory-database"
+    # Quote the keyword to enforce exact-phrase matching (avoids substring hits)
+    q = f'"{keyword}" repo:github/advisory-database'
     # Optional path-based type filter
     if advisory_type:
         type_path_map = {
@@ -164,9 +165,15 @@ async def _search_advisories_by_code_search(
             return_exceptions=True,
         )
 
+    # Post-filter: keyword must appear as a whole word in summary or description
+    kw_pattern = re.compile(r'\b' + re.escape(keyword) + r'\b', re.IGNORECASE)
+
     results = []
     for adv in advisories:
         if not isinstance(adv, dict) or not adv:
+            continue
+        text = adv.get("summary", "") + " " + adv.get("description", "")
+        if not kw_pattern.search(text):
             continue
         if severity and adv.get("severity", "").lower() != severity.lower():
             continue
