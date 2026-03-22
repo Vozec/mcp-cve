@@ -385,6 +385,7 @@ async def search_advisories(
     sort: Optional[str] = None,
     direction: Optional[str] = None,
     per_page: int = 30,
+    force_reload: bool = False,
 ) -> list[dict]:
     """Search GitHub Advisory Database.
 
@@ -404,9 +405,10 @@ async def search_advisories(
         eco=ecosystem, sev=severity, type=advisory_type, cwes=cwes,
         affects=affects, sort=sort, pp=per_page,
     )
-    cached = await cache_get(cache_key)
-    if cached is not None:
-        return cached
+    if not force_reload:
+        cached = await cache_get(cache_key)
+        if cached is not None:
+            return cached
 
     # Keyword search: use Code Search on the advisory-database repo
     if keyword and not cve_id and not ghsa_id:
@@ -456,6 +458,7 @@ async def search_advisories_all_types(
     ecosystem: Optional[str] = None,
     severity: Optional[str] = None,
     per_page: int = 20,
+    force_reload: bool = False,
 ) -> dict:
     """Search advisories across all types: reviewed, unreviewed, malware.
 
@@ -480,9 +483,9 @@ async def search_advisories_all_types(
     else:
         # No keyword: REST API with type filters
         reviewed, unreviewed, malware = await asyncio.gather(
-            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="reviewed", per_page=per_page),
-            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="unreviewed", per_page=per_page),
-            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="malware", per_page=min(per_page, 5)),
+            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="reviewed", per_page=per_page, force_reload=force_reload),
+            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="unreviewed", per_page=per_page, force_reload=force_reload),
+            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="malware", per_page=min(per_page, 5), force_reload=force_reload),
             return_exceptions=True,
         )
 

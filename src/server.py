@@ -1107,6 +1107,7 @@ async def search_advisories(
     cwes: Optional[str] = None,
     include_unreviewed: bool = True,
     per_page: int = 20,
+    force_reload: bool = False,
 ) -> dict:
     """
     Search the GitHub Advisory Database (GHSA). Can search reviewed (GitHub-verified),
@@ -1123,13 +1124,14 @@ async def search_advisories(
         cwes: Comma-separated CWE IDs to filter (e.g. "79,89,502").
         include_unreviewed: If true and no advisory_type specified, also search unreviewed advisories (default true).
         per_page: Results per page (default 20, max 100).
+        force_reload: If true, bypass Redis cache and fetch fresh results.
     """
     if advisory_type:
         # Single type search
         results = await github.search_advisories(
             keyword=keyword, cve_id=cve_id, ecosystem=ecosystem,
             severity=severity, advisory_type=advisory_type, cwes=cwes,
-            per_page=per_page,
+            per_page=per_page, force_reload=force_reload,
         )
         return {
             "keyword": keyword, "cve_id": cve_id, "type": advisory_type,
@@ -1140,7 +1142,8 @@ async def search_advisories(
     if include_unreviewed:
         # Search both reviewed and unreviewed
         all_types = await github.search_advisories_all_types(
-            keyword=keyword, ecosystem=ecosystem, severity=severity, per_page=per_page,
+            keyword=keyword, ecosystem=ecosystem, severity=severity,
+            per_page=per_page, force_reload=force_reload,
         )
         return {
             "keyword": keyword, "cve_id": cve_id,
@@ -1155,7 +1158,7 @@ async def search_advisories(
     # Default: reviewed only
     results = await github.search_advisories(
         keyword=keyword, cve_id=cve_id, ecosystem=ecosystem,
-        severity=severity, cwes=cwes, per_page=per_page,
+        severity=severity, cwes=cwes, per_page=per_page, force_reload=force_reload,
     )
     return {
         "keyword": keyword, "cve_id": cve_id, "type": "reviewed",
