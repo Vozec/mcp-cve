@@ -25,7 +25,7 @@ Search CVEs, exploits, PoCs, attack surfaces, writeups, and recon data across 15
 | `get_security_resources` | Writeups, cheatsheets, and exploit entries for any topic |
 | `search_vulners` | Lucene-syntax search across the Vulners database |
 | `search_nuclei_pocs` | CVEs with Nuclei templates or known PoCs (ProjectDiscovery) |
-| `search_advisories` | GitHub Advisory Database (reviewed + unreviewed) |
+| `search_advisories` | GitHub Advisory Database (reviewed + unreviewed) — supporte `force_reload` pour bypasser le cache Redis |
 | `search_gitlab_security` | GitLab project security signals |
 
 ## Quick Start
@@ -66,7 +66,7 @@ All keys are optional — tools degrade gracefully when a key is missing.
 | Variable | Required for | Link |
 |----------|-------------|------|
 | `NVD_API_KEY` | Higher NVD rate limits | [nvd.nist.gov](https://nvd.nist.gov/developers/request-an-api-key) |
-| `GITHUB_TOKEN` | GitHub search tools | [github.com/settings/tokens](https://github.com/settings/tokens) |
+| `GITHUB_TOKEN` | **Requis** pour `search_advisories` (Code Search API) et GitHub search tools — sans token, la recherche d'advisories par mot-clé retourne 0 résultats | [github.com/settings/tokens](https://github.com/settings/tokens) |
 | `GITLAB_TOKEN` | GitLab search tools | [gitlab.com/-/user_settings/personal_access_tokens](https://gitlab.com/-/user_settings/personal_access_tokens) |
 | `SHODAN_API_KEY` | Recon / exposure data | [account.shodan.io](https://account.shodan.io) |
 | `VULNERS_API_KEY` | Vulners search | [vulners.com/userinfo](https://vulners.com/userinfo) |
