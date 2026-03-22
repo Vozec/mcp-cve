@@ -92,149 +92,6 @@ async def _fetch_advisory_by_ghsa(client: httpx.AsyncClient, ghsa_id: str) -> Op
     return None
 
 
-async def _search_advisories_graphql(
-    keyword: str,
-    advisory_type: Optional[str] = None,
-    ecosystem: Optional[str] = None,
-    severity: Optional[str] = None,
-    per_page: int = 20,
-) -> list[dict]:
-    """Full-text search on GitHub Advisory Database via GraphQL API.
-
-    Uses the securityAdvisories(query:) field — the same engine that powers
-    github.com/advisories?query=<keyword>. Requires a GitHub token with
-    at least public read access (no special scope needed for public advisories).
-    """
-    # Map advisory_type to GraphQL classification filter
-    type_filter = ""
-    if advisory_type == "reviewed":
-        type_filter = ', classifications: [GENERAL]'
-    elif advisory_type == "malware":
-        type_filter = ', classifications: [MALWARE]'
-    # "unreviewed" has no direct GraphQL classification — omit filter
-
-    # Map severity to GraphQL enum
-    severity_filter = ""
-    if severity:
-        sev_map = {
-            "critical": "CRITICAL",
-            "high": "HIGH",
-            "medium": "MODERATE",
-            "low": "LOW",
-        }
-        gql_sev = sev_map.get(severity.lower())
-        if gql_sev:
-            severity_filter = f', severities: [{gql_sev}]'
-
-    # Map ecosystem to GraphQL enum
-    eco_filter = ""
-    if ecosystem:
-        eco_map = {
-            "npm": "NPM", "pip": "PIP", "maven": "MAVEN",
-            "go": "GO", "nuget": "NUGET", "composer": "COMPOSER",
-            "cargo": "RUST", "rubygems": "RUBYGEMS",
-        }
-        gql_eco = eco_map.get(ecosystem.lower())
-        if gql_eco:
-            eco_filter = f', ecosystem: {gql_eco}'
-
-    query = """
-query($query: String!, $first: Int!) {
-  securityAdvisories(query: $query, first: $first, orderBy: {field: UPDATED_AT, direction: DESC}%s%s%s) {
-    nodes {
-      ghsaId
-      summary
-      description
-      severity
-      publishedAt
-      updatedAt
-      withdrawnAt
-      origin
-      references { url }
-      identifiers { type value }
-      cvss { score vectorString }
-      cwes(first: 10) { nodes { cweId } }
-      vulnerabilities(first: 10) {
-        nodes {
-          package { name ecosystem }
-          vulnerableVersionRange
-          firstPatchedVersion { identifier }
-        }
-      }
-    }
-  }
-}
-""" % (type_filter, severity_filter, eco_filter)
-
-    variables = {"query": keyword, "first": min(per_page, 100)}
-
-    _debug_error: Optional[str] = None
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
-            resp = await client.post(
-                "https://api.github.com/graphql",
-                json={"query": query, "variables": variables},
-            )
-            if resp.status_code != 200:
-                _debug_error = f"GraphQL HTTP {resp.status_code}: {resp.text[:300]}"
-            else:
-                data = resp.json()
-                if data.get("errors"):
-                    _debug_error = f"GraphQL errors: {data['errors']}"
-    except Exception as e:
-        _debug_error = f"GraphQL exception: {e}"
-
-    if _debug_error is not None:
-        import logging
-        logging.getLogger(__name__).warning("_search_advisories_graphql: %s", _debug_error)
-        return []
-
-    nodes = (
-        data.get("data", {})
-        .get("securityAdvisories", {})
-        .get("nodes", [])
-    )
-    if not nodes:
-        return []
-
-    results = []
-    for node in nodes:
-        identifiers = node.get("identifiers", [])
-        cve_id = next((i["value"] for i in identifiers if i.get("type") == "CVE"), "")
-        ghsa_id = node.get("ghsaId", "")
-        affected = []
-        for v in node.get("vulnerabilities", {}).get("nodes", []):
-            pkg = v.get("package", {})
-            affected.append({
-                "ecosystem": pkg.get("ecosystem", ""),
-                "package": pkg.get("name", ""),
-                "vulnerable_range": v.get("vulnerableVersionRange", ""),
-                "first_patched": (v.get("firstPatchedVersion") or {}).get("identifier", ""),
-            })
-        cvss = node.get("cvss") or {}
-        results.append({
-            "ghsa_id": ghsa_id,
-            "cve_id": cve_id,
-            "summary": node.get("summary", ""),
-            "description": (node.get("description") or "")[:500],
-            "type": node.get("origin", "").lower(),
-            "severity": node.get("severity", "").lower(),
-            "cvss_score": cvss.get("score"),
-            "cvss_vector": cvss.get("vectorString"),
-            "epss_score": None,
-            "epss_percentile": None,
-            "cwes": [c.get("cweId", "") for c in node.get("cwes", {}).get("nodes", [])],
-            "affected": affected,
-            "published": node.get("publishedAt", ""),
-            "updated": node.get("updatedAt", ""),
-            "withdrawn": node.get("withdrawnAt"),
-            "url": f"https://github.com/advisories/{ghsa_id}" if ghsa_id else "",
-            "references": [r.get("url", "") for r in node.get("references", [])],
-        })
-
-    return results
-
-
 async def _search_advisories_by_code_search(
     keyword: str,
     advisory_type: Optional[str] = None,
@@ -331,34 +188,14 @@ async def _search_advisories_by_keyword(
 ) -> list[dict]:
     """Keyword search on GitHub Advisory Database.
 
-    Strategy (in priority order):
-    1. GraphQL securityAdvisories(query:) — exact same engine as github.com/advisories
-    2. Code Search on github/advisory-database — fallback when no token
-    3. REST /advisories?affects=<keyword> — package name match, merged for completeness
+    Runs two strategies in parallel and merges results:
+    1. Code Search on github/advisory-database — full-text, requires GITHUB_TOKEN
+    2. REST /advisories?affects=<keyword> — package name match (no auth needed)
+
+    Results are deduplicated by GHSA ID, code search results ranked first.
     """
     import asyncio
 
-    # GraphQL is the primary strategy: same full-text engine as the GitHub web UI
-    graphql_results = await _search_advisories_graphql(
-        keyword=keyword, advisory_type=advisory_type,
-        ecosystem=ecosystem, severity=severity, per_page=per_page,
-    )
-
-    if graphql_results:
-        # Also fetch REST affects-match in parallel for completeness, then merge
-        affects_results = await _rest_advisories(
-            advisory_type=advisory_type, ecosystem=ecosystem,
-            severity=severity, affects=keyword, per_page=per_page,
-        )
-        seen: set = {r["ghsa_id"] for r in graphql_results if r.get("ghsa_id")}
-        for r in (affects_results if isinstance(affects_results, list) else []):
-            ghsa = r.get("ghsa_id", "")
-            if ghsa and ghsa not in seen:
-                seen.add(ghsa)
-                graphql_results.append(r)
-        return graphql_results[:per_page]
-
-    # Fallback: Code Search + REST affects (no token or GraphQL unavailable)
     code_results, affects_results = await asyncio.gather(
         _search_advisories_by_code_search(
             keyword=keyword, advisory_type=advisory_type,
@@ -371,7 +208,7 @@ async def _search_advisories_by_keyword(
         return_exceptions=True,
     )
 
-    seen2: set = set()
+    seen: set = set()
     results: list = []
 
     for batch in [code_results, affects_results]:
@@ -379,9 +216,9 @@ async def _search_advisories_by_keyword(
             continue
         for r in batch:
             ghsa = r.get("ghsa_id", "")
-            if not ghsa or ghsa in seen2:
+            if not ghsa or ghsa in seen:
                 continue
-            seen2.add(ghsa)
+            seen.add(ghsa)
             results.append(r)
 
     return results[:per_page]
