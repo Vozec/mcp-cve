@@ -123,37 +123,41 @@ async def _search_advisories_by_code_search(
 
     import logging
     log = logging.getLogger(__name__)
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
-            resp = await client.get(
-                f"{API_URL}/search/code",
-                params={"q": q, "per_page": min(per_page, 30)},
-            )
-            if resp.status_code != 200:
-                log.warning("code_search HTTP %s for query %r: %s", resp.status_code, q, resp.text[:300])
-                return []
-            data = resp.json()
-            log.info("code_search query %r → %d items", q, len(data.get("items", [])))
-    except Exception as e:
-        log.warning("code_search exception for query %r: %s", q, e)
-        return []
 
-    # Extract GHSA IDs from file paths
-    # e.g. "advisories/github-reviewed/2023/02/GHSA-xxxx-xxxx-xxxx/GHSA-xxxx-xxxx-xxxx.json"
+    # Paginate Code Search (max 3 pages × 30 = 90 results) to collect all GHSA IDs.
+    # Results are ranked by relevance, not date — pagination ensures we don't miss
+    # recent advisories that land on later pages.
     ghsa_pattern = re.compile(r"(GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})", re.IGNORECASE)
     ghsa_ids: list[str] = []
     seen_ids: set = set()
-    for item in data.get("items", []):
-        path = item.get("path", "") + " " + item.get("name", "")
-        for match in ghsa_pattern.finditer(path):
-            ghsa_id = match.group(1).upper()
-            if ghsa_id not in seen_ids:
-                seen_ids.add(ghsa_id)
-                ghsa_ids.append(ghsa_id)
-                if len(ghsa_ids) >= per_page:
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
+            for page in range(1, 4):  # pages 1-3 → up to 90 results
+                resp = await client.get(
+                    f"{API_URL}/search/code",
+                    params={"q": q, "per_page": 30, "page": page},
+                )
+                if resp.status_code != 200:
+                    log.warning("code_search HTTP %s (page %d) for query %r: %s",
+                                resp.status_code, page, q, resp.text[:300])
                     break
-        if len(ghsa_ids) >= per_page:
-            break
+                data = resp.json()
+                items = data.get("items", [])
+                log.info("code_search query %r page %d → %d items", q, page, len(items))
+                for item in items:
+                    path = item.get("path", "") + " " + item.get("name", "")
+                    for match in ghsa_pattern.finditer(path):
+                        ghsa_id = match.group(1).upper()
+                        if ghsa_id not in seen_ids:
+                            seen_ids.add(ghsa_id)
+                            ghsa_ids.append(ghsa_id)
+                if len(items) < 30:
+                    break  # last page
+    except Exception as e:
+        log.warning("code_search exception for query %r: %s", q, e)
+        if not ghsa_ids:
+            return []
 
     if not ghsa_ids:
         return []
@@ -227,6 +231,9 @@ async def _search_advisories_by_keyword(
                 continue
             seen.add(ghsa)
             results.append(r)
+
+    # Sort by published date descending (most recent first)
+    results.sort(key=lambda r: r.get("published") or "", reverse=True)
 
     return results[:per_page]
 
