@@ -5,7 +5,7 @@ from mcp.server.fastmcp import FastMCP
 from config import HTTP_TIMEOUT, USER_AGENT
 
 from connectors import (
-    nvd, osv, epss, kev, github, gitlab, exploitdb, hackyx, shodan,
+    nvd, osv, epss, kev, github, gitlab, hackyx, shodan,
     searchsploit, vulners, poc_in_github, nuclei_api, hacktricks,
 )
 
@@ -272,7 +272,7 @@ async def get_cve_details(
     (
         nvd_data, epss_data, kev_entry,
         poc_repos, poc_aggregated,
-        edb_results, ssploit_results,
+        ssploit_results,
         nuclei_gh, nuclei_cve, msf_results,
         vulners_data, hackyx_results, gh_commits,
     ) = await asyncio.gather(
@@ -281,7 +281,6 @@ async def get_cve_details(
         kev.get_kev_entry(cve_id),
         github.search_poc_repos(cve_id, per_page=per),
         poc_in_github.search_poc(cve_id),
-        exploitdb.search_by_cve(cve_id),
         searchsploit.search_by_cve(cve_id),
         github.search_nuclei_templates(cve_id),
         nuclei_api.search_cves(keyword=cve_id, limit=per),
@@ -297,7 +296,6 @@ async def get_cve_details(
     kev_entry = _safe(kev_entry)
     poc_repos = _clean_list(_safe(poc_repos, []))
     poc_aggregated = _clean_list(_safe(poc_aggregated, []))
-    edb_results = _clean_list(_safe(edb_results, []))
     ssploit_results = _clean_list(_safe(ssploit_results, []))
     nuclei_gh = _clean_list(_safe(nuclei_gh, []))
     nuclei_cve_data = _safe(nuclei_cve, {})
@@ -326,16 +324,7 @@ async def get_cve_details(
                 "template_url": nc.get("nuclei_template_url", ""),
             })
 
-    # Merge searchsploit + exploitdb (deduplicate by edb_id)
-    seen_edb = set()
-    all_edb = []
-    for e in ssploit_results + edb_results:
-        eid = e.get("edb_id", "")
-        if eid and eid not in seen_edb:
-            seen_edb.add(eid)
-            all_edb.append(e)
-        elif not eid:
-            all_edb.append(e)
+    all_edb = ssploit_results
 
     total_exploits = len(all_pocs) + len(all_edb) + len(nuclei_gh) + len(msf_results) + len(nuclei_api_data)
 
@@ -390,12 +379,12 @@ async def search_exploits(
 ) -> dict:
     """
     Search for public exploits and PoCs across all sources: GitHub repos, PoC-in-GitHub,
-    Exploit-DB, SearchSploit, Metasploit modules, Nuclei templates, and Vulners.
+    SearchSploit, Metasploit modules, Nuclei templates, and Vulners.
 
     Args:
         cve_id: CVE identifier to search exploits for (e.g. "CVE-2024-1234").
         software: Software name to search exploits for (e.g. "Apache Struts").
-        exploit_type: Filter by type: "poc", "metasploit", "nuclei", "exploitdb", "searchsploit", "vulners", or None for all.
+        exploit_type: Filter by type: "poc", "metasploit", "nuclei", "searchsploit", "vulners", or None for all.
         limit: Max results per source (default 10).
         include_poc_content: If true, fetch and include raw content of each PoC URL (default false).
     """
@@ -411,9 +400,8 @@ async def search_exploits(
         if cve_id:
             tasks["poc_in_github"] = poc_in_github.search_poc(cve_id)
 
-    if exploit_type in (None, "exploitdb", "searchsploit"):
+    if exploit_type in (None, "searchsploit"):
         tasks["searchsploit"] = searchsploit.search(query, limit=per)
-        tasks["exploit_db"] = exploitdb.search_exploits(query)
 
     if exploit_type in (None, "nuclei"):
         tasks["nuclei_github"] = github.search_nuclei_templates(query)
@@ -603,10 +591,13 @@ async def search_github_security(
             tasks["github_commits"] = github.search_security_commits(query)
         if signal_type in (None, "advisory"):
             tasks["github_advisories"] = github.search_advisories(keyword=query)
-        # Label-based search for specific repo
-        if "/" in target and not is_gitlab and signal_type in (None, "issue"):
-            sec_labels = label_list or ["security", "vulnerability"]
-            tasks["github_labeled_issues"] = github.search_issues_by_label(target, sec_labels, per_page=15)
+        # Label-based search + repo Security tab for specific repos
+        if "/" in target and not is_gitlab:
+            if signal_type in (None, "issue"):
+                sec_labels = label_list or ["security", "vulnerability"]
+                tasks["github_labeled_issues"] = github.search_issues_by_label(target, sec_labels, per_page=15)
+            if signal_type in (None, "advisory"):
+                tasks["github_repo_security"] = github.search_repo_security_advisories(target, per_page=10)
 
     # --- GitLab ---
     if is_gitlab or platform is None:

@@ -24,26 +24,28 @@ from connectors import github, nvd, epss, kev, osv, searchsploit, poc_in_github,
 
 @pytest.mark.asyncio
 async def test_search_advisories_keyword_spip():
-    """Keyword search for 'spip' must return at least 1 advisory."""
+    """Keyword search for 'spip' must return SPIP-related advisories only."""
     results = await github.search_advisories(keyword="spip", per_page=5)
     assert isinstance(results, list), "Should return a list"
     assert len(results) > 0, "Should find SPIP advisories"
-    # No error entries
     for r in results:
         assert "error" not in r, f"Got error: {r}"
-    # Each entry should have a ghsa_id or cve_id
-    for r in results:
         assert r.get("ghsa_id") or r.get("cve_id"), f"Advisory missing ID: {r}"
+        # Verify result is actually about SPIP
+        text = (r.get("summary", "") + r.get("description", "")).lower()
+        assert "spip" in text, f"Non-SPIP result: {r.get('ghsa_id')} — {r.get('summary')}"
 
 
 @pytest.mark.asyncio
-async def test_search_advisories_keyword_log4j():
-    """Keyword search for 'log4j' must return advisories."""
-    results = await github.search_advisories(keyword="log4j", per_page=5)
+async def test_search_advisories_keyword_wordpress():
+    """Keyword search for 'WordPress' must return advisories (active package, always recent)."""
+    results = await github.search_advisories(keyword="wordpress", per_page=5)
     assert isinstance(results, list)
-    assert len(results) > 0, "Should find log4j advisories"
+    assert len(results) > 0, "Should find WordPress advisories"
     for r in results:
         assert "error" not in r
+        text = (r.get("summary", "") + r.get("description", "")).lower()
+        assert "wordpress" in text, f"Non-WordPress result: {r.get('ghsa_id')} — {r.get('summary')}"
 
 
 @pytest.mark.asyncio
@@ -68,13 +70,18 @@ async def test_search_advisories_by_ecosystem():
 
 @pytest.mark.asyncio
 async def test_search_advisories_all_types_spip():
-    """search_advisories_all_types for 'spip' must return results in reviewed or unreviewed."""
+    """search_advisories_all_types for 'spip' must return SPIP results in reviewed or unreviewed."""
     result = await github.search_advisories_all_types(keyword="spip", per_page=5)
     assert isinstance(result, dict)
     assert "reviewed" in result
     assert "unreviewed" in result
     total = len(result["reviewed"]) + len(result["unreviewed"])
     assert total > 0, f"Expected advisories for spip, got: {result}"
+    # All results must mention spip in summary or description
+    all_results = result["reviewed"] + result["unreviewed"]
+    for r in all_results:
+        text = (r.get("summary", "") + r.get("description", "")).lower()
+        assert "spip" in text, f"Non-SPIP result slipped through: {r.get('ghsa_id')} — {r.get('summary')}"
 
 
 @pytest.mark.asyncio

@@ -54,6 +54,171 @@ def _parse_advisory(adv: dict) -> dict:
     }
 
 
+async def _rest_advisories(
+    advisory_type: Optional[str] = None,
+    ecosystem: Optional[str] = None,
+    severity: Optional[str] = None,
+    affects: Optional[str] = None,
+    per_page: int = 30,
+) -> list[dict]:
+    """Raw REST /advisories call — no keyword support, used internally."""
+    params: dict = {"per_page": min(per_page, 100)}
+    if advisory_type:
+        params["type"] = advisory_type
+    if ecosystem:
+        params["ecosystem"] = ecosystem
+    if severity:
+        params["severity"] = severity
+    if affects:
+        params["affects"] = affects
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
+            resp = await client.get(f"{API_URL}/advisories", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return []
+    return [_parse_advisory(adv) for adv in (data if isinstance(data, list) else [])]
+
+
+async def _fetch_advisory_by_ghsa(client: httpx.AsyncClient, ghsa_id: str) -> Optional[dict]:
+    """Fetch a single advisory by GHSA ID via REST."""
+    try:
+        resp = await client.get(f"{API_URL}/advisories/{ghsa_id}")
+        if resp.status_code == 200:
+            return _parse_advisory(resp.json())
+    except Exception:
+        pass
+    return None
+
+
+async def _search_advisories_by_code_search(
+    keyword: str,
+    advisory_type: Optional[str] = None,
+    ecosystem: Optional[str] = None,
+    severity: Optional[str] = None,
+    per_page: int = 20,
+) -> list[dict]:
+    """Full-text search on github/advisory-database via Code Search API.
+
+    This mirrors github.com/advisories?query=<keyword> — same underlying data.
+    Extracts GHSA IDs from file paths, then fetches advisory details in parallel.
+    """
+    import asyncio
+    import re
+
+    # Build code search query on the advisory-database repo
+    q = f"{keyword} repo:github/advisory-database"
+    # Optional path-based type filter
+    if advisory_type:
+        type_path_map = {
+            "reviewed": "advisories/github-reviewed",
+            "unreviewed": "advisories/unreviewed",
+            "malware": "advisories/github-reviewed/malware",
+        }
+        path_prefix = type_path_map.get(advisory_type)
+        if path_prefix:
+            q += f" path:{path_prefix}"
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
+            resp = await client.get(
+                f"{API_URL}/search/code",
+                params={"q": q, "per_page": min(per_page, 30)},
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+    except Exception:
+        return []
+
+    # Extract GHSA IDs from file paths
+    # e.g. "advisories/github-reviewed/2023/02/GHSA-xxxx-xxxx-xxxx/GHSA-xxxx-xxxx-xxxx.json"
+    ghsa_pattern = re.compile(r"(GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})", re.IGNORECASE)
+    ghsa_ids: list[str] = []
+    seen_ids: set = set()
+    for item in data.get("items", []):
+        path = item.get("path", "") + " " + item.get("name", "")
+        for match in ghsa_pattern.finditer(path):
+            ghsa_id = match.group(1).upper()
+            if ghsa_id not in seen_ids:
+                seen_ids.add(ghsa_id)
+                ghsa_ids.append(ghsa_id)
+                if len(ghsa_ids) >= per_page:
+                    break
+        if len(ghsa_ids) >= per_page:
+            break
+
+    if not ghsa_ids:
+        return []
+
+    # Fetch all matched advisories in parallel
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
+        advisories = await asyncio.gather(
+            *[_fetch_advisory_by_ghsa(client, gid) for gid in ghsa_ids],
+            return_exceptions=True,
+        )
+
+    results = []
+    for adv in advisories:
+        if not isinstance(adv, dict) or not adv:
+            continue
+        if severity and adv.get("severity", "").lower() != severity.lower():
+            continue
+        if ecosystem:
+            pkgs = [a.get("ecosystem", "").lower() for a in adv.get("affected", [])]
+            if ecosystem.lower() not in pkgs:
+                continue
+        results.append(adv)
+
+    return results
+
+
+async def _search_advisories_by_keyword(
+    keyword: str,
+    advisory_type: Optional[str] = None,
+    ecosystem: Optional[str] = None,
+    severity: Optional[str] = None,
+    per_page: int = 20,
+) -> list[dict]:
+    """Keyword search on GitHub Advisory Database.
+
+    Runs two strategies in parallel and merges results:
+    1. Code Search on github/advisory-database — full-text, same source as github.com/advisories
+    2. REST /advisories?affects=<keyword> — package name match (fast, catches ecosystem packages)
+
+    Results are deduplicated by GHSA ID, code search results ranked first.
+    """
+    import asyncio
+
+    code_results, affects_results = await asyncio.gather(
+        _search_advisories_by_code_search(
+            keyword=keyword, advisory_type=advisory_type,
+            ecosystem=ecosystem, severity=severity, per_page=per_page,
+        ),
+        _rest_advisories(
+            advisory_type=advisory_type, ecosystem=ecosystem,
+            severity=severity, affects=keyword, per_page=per_page,
+        ),
+        return_exceptions=True,
+    )
+
+    seen: set = set()
+    results: list = []
+
+    for batch in [code_results, affects_results]:
+        if isinstance(batch, Exception) or not isinstance(batch, list):
+            continue
+        for r in batch:
+            ghsa = r.get("ghsa_id", "")
+            if not ghsa or ghsa in seen:
+                continue
+            seen.add(ghsa)
+            results.append(r)
+
+    return results[:per_page]
+
+
 async def search_advisories(
     keyword: Optional[str] = None,
     cve_id: Optional[str] = None,
@@ -67,10 +232,11 @@ async def search_advisories(
     direction: Optional[str] = None,
     per_page: int = 30,
 ) -> list[dict]:
-    """Search GitHub Advisory Database via REST API.
+    """Search GitHub Advisory Database.
 
-    Supports full-text search via q= parameter, CVE/GHSA lookups,
-    ecosystem/severity/type filters, and CWE filtering.
+    Uses Code Search on github/advisory-database for keyword queries (accurate, same
+    source as github.com/advisories). Falls back to REST API for precise lookups
+    (CVE ID, GHSA ID, ecosystem, CWE filters).
 
     Args:
         advisory_type: "reviewed" (GitHub-verified), "unreviewed" (community/third-party), "malware", or None for all.
@@ -80,7 +246,7 @@ async def search_advisories(
         direction: "asc" or "desc".
     """
     cache_key = make_key(
-        "gh_advisories", keyword=keyword, cve=cve_id, ghsa=ghsa_id,
+        "gh_advisories2", keyword=keyword, cve=cve_id, ghsa=ghsa_id,
         eco=ecosystem, sev=severity, type=advisory_type, cwes=cwes,
         affects=affects, sort=sort, pp=per_page,
     )
@@ -88,10 +254,17 @@ async def search_advisories(
     if cached is not None:
         return cached
 
-    # REST API — supports q= for full-text search (GitHub added this parameter)
+    # Keyword search: use Code Search on the advisory-database repo
+    if keyword and not cve_id and not ghsa_id:
+        results = await _search_advisories_by_keyword(
+            keyword=keyword, advisory_type=advisory_type,
+            ecosystem=ecosystem, severity=severity, per_page=per_page,
+        )
+        await cache_set(cache_key, results, ttl=1800)
+        return results
+
+    # Precise lookup: REST API (CVE ID, GHSA ID, ecosystem, CWE, type filters)
     params = {"per_page": min(per_page, 100)}
-    if keyword:
-        params["q"] = keyword
     if cve_id:
         params["cve_id"] = cve_id
     if ghsa_id:
@@ -120,7 +293,6 @@ async def search_advisories(
         return [{"error": f"GitHub Advisory API error: {e}"}]
 
     results = [_parse_advisory(adv) for adv in (data if isinstance(data, list) else [])]
-
     await cache_set(cache_key, results, ttl=1800)
     return results
 
@@ -133,8 +305,8 @@ async def search_advisories_all_types(
 ) -> dict:
     """Search advisories across all types: reviewed, unreviewed, malware.
 
-    Uses parallel REST API calls with type filters. The q= parameter handles
-    full-text keyword search for all types.
+    When a keyword is given, uses parallel Code Search calls per type (accurate).
+    Without a keyword, uses parallel REST calls with type filters.
     """
     import asyncio
 
@@ -143,12 +315,22 @@ async def search_advisories_all_types(
             return []
         return [r for r in val if not isinstance(r, dict) or "error" not in r]
 
-    reviewed, unreviewed, malware = await asyncio.gather(
-        search_advisories(keyword=keyword, ecosystem=ecosystem, severity=severity, advisory_type="reviewed", per_page=per_page),
-        search_advisories(keyword=keyword, ecosystem=ecosystem, severity=severity, advisory_type="unreviewed", per_page=per_page),
-        search_advisories(keyword=keyword, ecosystem=ecosystem, severity=severity, advisory_type="malware", per_page=min(per_page, 5)),
-        return_exceptions=True,
-    )
+    if keyword:
+        # Parallel Code Search — one per type for accurate results
+        reviewed, unreviewed, malware = await asyncio.gather(
+            _search_advisories_by_keyword(keyword=keyword, advisory_type="reviewed", ecosystem=ecosystem, severity=severity, per_page=per_page),
+            _search_advisories_by_keyword(keyword=keyword, advisory_type="unreviewed", ecosystem=ecosystem, severity=severity, per_page=per_page),
+            _search_advisories_by_keyword(keyword=keyword, advisory_type="malware", ecosystem=ecosystem, severity=severity, per_page=min(per_page, 5)),
+            return_exceptions=True,
+        )
+    else:
+        # No keyword: REST API with type filters
+        reviewed, unreviewed, malware = await asyncio.gather(
+            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="reviewed", per_page=per_page),
+            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="unreviewed", per_page=per_page),
+            search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="malware", per_page=min(per_page, 5)),
+            return_exceptions=True,
+        )
 
     return {
         "reviewed": safe(reviewed),
@@ -302,6 +484,52 @@ async def search_issues_by_label(
             "updated": item.get("updated_at", ""),
             "comments": item.get("comments", 0),
             "body_excerpt": (item.get("body") or "")[:500],
+        })
+
+    await cache_set(cache_key, results, ttl=1800)
+    return results
+
+
+async def search_repo_security_advisories(
+    repo: str,
+    per_page: int = 20,
+) -> list[dict]:
+    """Fetch security advisories from a specific repo's Security tab (GHSA).
+
+    Calls GET /repos/{owner}/{repo}/security-advisories.
+    Returns [] for repos with no published security advisories or missing access.
+    """
+    cache_key = make_key("gh_repo_sec_adv", repo=repo)
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
+            resp = await client.get(
+                f"{API_URL}/repos/{repo}/security-advisories",
+                params={"per_page": per_page, "sort": "published", "direction": "desc"},
+            )
+            if resp.status_code in (404, 403):
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        return [{"error": f"GitHub repo security advisories error: {e}"}]
+
+    results = []
+    for adv in data if isinstance(data, list) else []:
+        results.append({
+            "ghsa_id": adv.get("ghsa_id", ""),
+            "cve_id": adv.get("cve_id", ""),
+            "summary": adv.get("summary", ""),
+            "description": (adv.get("description") or "")[:500],
+            "severity": adv.get("severity", ""),
+            "state": adv.get("state", ""),
+            "published": adv.get("published_at", ""),
+            "url": adv.get("html_url", ""),
+            "cvss_score": adv.get("cvss", {}).get("score") if adv.get("cvss") else None,
+            "cwes": [c.get("cwe_id", "") for c in adv.get("cwes", [])],
         })
 
     await cache_set(cache_key, results, ttl=1800)
