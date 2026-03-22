@@ -168,6 +168,7 @@ query($query: String!, $first: Int!) {
 
     variables = {"query": keyword, "first": min(per_page, 100)}
 
+    _debug_error: Optional[str] = None
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
             resp = await client.post(
@@ -175,9 +176,17 @@ query($query: String!, $first: Int!) {
                 json={"query": query, "variables": variables},
             )
             if resp.status_code != 200:
-                return []
-            data = resp.json()
-    except Exception:
+                _debug_error = f"GraphQL HTTP {resp.status_code}: {resp.text[:300]}"
+            else:
+                data = resp.json()
+                if data.get("errors"):
+                    _debug_error = f"GraphQL errors: {data['errors']}"
+    except Exception as e:
+        _debug_error = f"GraphQL exception: {e}"
+
+    if _debug_error is not None:
+        import logging
+        logging.getLogger(__name__).warning("_search_advisories_graphql: %s", _debug_error)
         return []
 
     nodes = (
@@ -254,6 +263,8 @@ async def _search_advisories_by_code_search(
         if path_prefix:
             q += f" path:{path_prefix}"
 
+    import logging
+    log = logging.getLogger(__name__)
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_headers()) as client:
             resp = await client.get(
@@ -261,9 +272,12 @@ async def _search_advisories_by_code_search(
                 params={"q": q, "per_page": min(per_page, 30)},
             )
             if resp.status_code != 200:
+                log.warning("code_search HTTP %s for query %r: %s", resp.status_code, q, resp.text[:300])
                 return []
             data = resp.json()
-    except Exception:
+            log.info("code_search query %r → %d items", q, len(data.get("items", [])))
+    except Exception as e:
+        log.warning("code_search exception for query %r: %s", q, e)
         return []
 
     # Extract GHSA IDs from file paths
