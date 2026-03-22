@@ -54,6 +54,144 @@ def _parse_advisory(adv: dict) -> dict:
     }
 
 
+GRAPHQL_URL = "https://api.github.com/graphql"
+
+# GraphQL severity values (different from REST)
+_SEVERITY_MAP = {
+    "critical": "CRITICAL",
+    "high": "HIGH",
+    "medium": "MODERATE",
+    "moderate": "MODERATE",
+    "low": "LOW",
+}
+
+# GraphQL ecosystem values
+_ECOSYSTEM_MAP = {
+    "npm": "NPM",
+    "pip": "PIP",
+    "maven": "MAVEN",
+    "go": "GO",
+    "nuget": "NUGET",
+    "composer": "COMPOSER",
+    "cargo": "RUST",
+    "rubygems": "RUBYGEMS",
+    "rust": "RUST",
+}
+
+
+def _parse_advisory_graphql(node: dict) -> dict:
+    identifiers = node.get("identifiers", [])
+    cve_id = next((i["value"] for i in identifiers if i.get("type") == "CVE"), None)
+    ghsa_id = next((i["value"] for i in identifiers if i.get("type") == "GHSA"), None)
+
+    vulns = node.get("vulnerabilities", {}).get("nodes", [])
+    affected = []
+    for v in vulns:
+        pkg = v.get("package", {}) or {}
+        affected.append({
+            "ecosystem": pkg.get("ecosystem", ""),
+            "package": pkg.get("name", ""),
+            "vulnerable_range": v.get("vulnerableVersionRange", ""),
+            "first_patched": (v.get("firstPatchedVersion") or {}).get("identifier", ""),
+        })
+
+    cwes_data = node.get("cwes", {}).get("nodes", [])
+
+    severity_raw = node.get("severity", "")
+    severity_map = {"MODERATE": "medium", "CRITICAL": "critical", "HIGH": "high", "LOW": "low"}
+    severity = severity_map.get(severity_raw, severity_raw.lower())
+
+    cvss = node.get("cvss", {}) or {}
+
+    refs = [r.get("url", "") for r in node.get("references", []) if r.get("url")]
+
+    return {
+        "ghsa_id": ghsa_id or "",
+        "cve_id": cve_id or "",
+        "summary": node.get("summary", ""),
+        "description": (node.get("description") or "")[:500],
+        "type": "unreviewed" if not node.get("origin") else node.get("origin", "").lower(),
+        "severity": severity,
+        "cvss_score": cvss.get("score"),
+        "cvss_vector": cvss.get("vectorString"),
+        "epss_score": None,
+        "epss_percentile": None,
+        "cwes": [c.get("cweId", "") for c in cwes_data],
+        "affected": affected,
+        "published": node.get("publishedAt", ""),
+        "updated": node.get("updatedAt", ""),
+        "withdrawn": node.get("withdrawnAt"),
+        "url": node.get("permalink", ""),
+        "source_code_location": "",
+        "references": refs,
+    }
+
+
+async def _search_advisories_graphql(
+    keyword: Optional[str] = None,
+    ecosystem: Optional[str] = None,
+    severity: Optional[str] = None,
+    per_page: int = 20,
+) -> list[dict]:
+    """Full-text search on GitHub Advisory Database via GraphQL API."""
+    first = min(per_page, 100)
+
+    # Build optional filters
+    eco_filter = f'ecosystem: {_ECOSYSTEM_MAP[ecosystem.lower()]}' if ecosystem and ecosystem.lower() in _ECOSYSTEM_MAP else ""
+    sev_filter = f'severity: {_SEVERITY_MAP[severity.lower()]}' if severity and severity.lower() in _SEVERITY_MAP else ""
+    filters = ", ".join(f for f in [eco_filter, sev_filter] if f)
+    if filters:
+        filters = ", " + filters
+
+    query_arg = f'query: "{keyword}"' if keyword else ""
+    args = ", ".join(a for a in [f"first: {first}", query_arg, "orderBy: {field: UPDATED_AT, direction: DESC}" + filters] if a)
+
+    graphql_query = f"""
+    query {{
+      securityAdvisories({args}) {{
+        totalCount
+        nodes {{
+          ghsaId
+          summary
+          description
+          severity
+          publishedAt
+          updatedAt
+          withdrawnAt
+          permalink
+          identifiers {{ type value }}
+          cvss {{ score vectorString }}
+          cwes(first: 5) {{ nodes {{ cweId }} }}
+          references {{ url }}
+          vulnerabilities(first: 10) {{
+            nodes {{
+              package {{ ecosystem name }}
+              vulnerableVersionRange
+              firstPatchedVersion {{ identifier }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+
+    headers = {**_headers(), "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers) as client:
+            resp = await client.post(GRAPHQL_URL, json={"query": graphql_query})
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        return [{"error": f"GitHub GraphQL Advisory error: {e}"}]
+
+    errors = data.get("errors")
+    if errors:
+        return [{"error": f"GraphQL error: {errors}"}]
+
+    nodes = data.get("data", {}).get("securityAdvisories", {}).get("nodes", [])
+    return [_parse_advisory_graphql(n) for n in nodes]
+
+
 async def search_advisories(
     keyword: Optional[str] = None,
     cve_id: Optional[str] = None,
@@ -68,6 +206,9 @@ async def search_advisories(
     per_page: int = 30,
 ) -> list[dict]:
     """Search GitHub Advisory Database.
+
+    Uses GraphQL full-text search when a keyword is provided (same engine as
+    github.com/advisories?query=...), falls back to REST API otherwise.
 
     Args:
         advisory_type: "reviewed" (GitHub-verified), "unreviewed" (community/third-party), "malware", or None for all.
@@ -85,6 +226,15 @@ async def search_advisories(
     if cached is not None:
         return cached
 
+    # Use GraphQL for keyword search (REST API does not support full-text search)
+    if keyword and not cve_id and not ghsa_id:
+        results = await _search_advisories_graphql(
+            keyword=keyword, ecosystem=ecosystem, severity=severity, per_page=per_page,
+        )
+        await cache_set(cache_key, results, ttl=1800)
+        return results
+
+    # REST API for precise lookups (CVE ID, GHSA ID, ecosystem, etc.)
     params = {"per_page": min(per_page, 100)}
     if cve_id:
         params["cve_id"] = cve_id
@@ -115,17 +265,6 @@ async def search_advisories(
 
     results = [_parse_advisory(adv) for adv in (data if isinstance(data, list) else [])]
 
-    # Client-side keyword filter (API doesn't support keyword search)
-    if keyword and results:
-        kw = keyword.lower()
-        results = [
-            r for r in results
-            if kw in r.get("summary", "").lower()
-            or kw in r.get("description", "").lower()
-            or kw in (r.get("cve_id") or "").lower()
-            or any(kw in a.get("package", "").lower() for a in r.get("affected", []))
-        ]
-
     await cache_set(cache_key, results, ttl=1800)
     return results
 
@@ -136,13 +275,37 @@ async def search_advisories_all_types(
     severity: Optional[str] = None,
     per_page: int = 20,
 ) -> dict:
-    """Search advisories across all types: reviewed, unreviewed, malware."""
+    """Search advisories across all types: reviewed, unreviewed, malware.
+
+    When a keyword is provided, uses a single GraphQL call (full-text search)
+    and returns all results under "unreviewed" for backwards compatibility.
+    Without a keyword, falls back to 3 parallel REST calls by type.
+    """
     import asyncio
 
+    if keyword:
+        # Single GraphQL call covers all types — no point splitting by type
+        results = await _search_advisories_graphql(
+            keyword=keyword, ecosystem=ecosystem, severity=severity, per_page=per_page,
+        )
+
+        def safe_list(val):
+            if isinstance(val, Exception):
+                return []
+            return [r for r in val if not isinstance(r, dict) or "error" not in r]
+
+        clean = safe_list(results)
+        return {
+            "reviewed": [],
+            "unreviewed": clean,
+            "malware": [],
+        }
+
+    # No keyword: use REST API with type filters in parallel
     reviewed, unreviewed, malware = await asyncio.gather(
-        search_advisories(keyword=keyword, ecosystem=ecosystem, severity=severity, advisory_type="reviewed", per_page=per_page),
-        search_advisories(keyword=keyword, ecosystem=ecosystem, severity=severity, advisory_type="unreviewed", per_page=per_page),
-        search_advisories(keyword=keyword, ecosystem=ecosystem, severity=severity, advisory_type="malware", per_page=min(per_page, 5)),
+        search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="reviewed", per_page=per_page),
+        search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="unreviewed", per_page=per_page),
+        search_advisories(ecosystem=ecosystem, severity=severity, advisory_type="malware", per_page=min(per_page, 5)),
         return_exceptions=True,
     )
 
